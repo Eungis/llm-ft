@@ -34,7 +34,7 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     # |Head_Dim / 2|
     theta_numerator = torch.arange(0, head_dim, 2).float()
     # |Head_Dim / 2|
-    theta = (1.0 / (theta ** (theta_numerator / head_dim))).to(device)
+    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)
     
     # Step 2: Build the positions (m parameter)
     # |Seq_Len|
@@ -92,38 +92,41 @@ class RMSNorm(nn.Module):
         super(RMSNorm, self).__init__()
         self.eps = eps
         # The `gamma` parameter in the paper
-        self.weight = nn.Parameter(torch.ones(size=dim))
+        self.weight = nn.Parameter(torch.ones(dim))
         
-    def forward(self, x:torch.Tensor):
+    def _norm(self, x:torch.Tensor):
         # |B, Seq_Len, Dim| * |B, Seq_Len, 1| = |B, Seq_Len, Dim|
         # rsqrt: 1 / sqrt(x)
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x: torch.Tensor):
+        # |Dim| * |B, Seq_Len, Dim|
+        return self.weight * self._norm(x.float()).type_as(x)
 
 class SelfAttention(nn.Module):
     
     def __init__(self, args: ModelArgs):
         super(SelfAttention, self).__init__()
         
-        # The number of heads for the Keys and Values
+        # Indicates the number of heads for the Keys and Values
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        # The number of heads for the Queries
-        # Note. `n_heads_q` cannot be `n_q_heads`. Otherwise it can't load the model weights.
+        # Indicates the number of heads for the Queries
         self.n_heads_q = args.n_heads
-        # Indicates how many times the Keys and Values should be repeated.
+        # Indicates how many times the Keys and Values should be repeated
         self.n_rep = self.n_heads_q // self.n_kv_heads
+        # Indicates the dimension of each head, that is, the part of the embedding that each head will be responsible for
         self.head_dim = args.dim // args.n_heads
-        
-        self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False)
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(self.n_heads_q * self.head_dim, args.dim)
-        
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
         self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
         self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
         
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-        batch_size, seq_len = x.shape # |B, 1, Dim|
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor, mask: Optional[torch.Tensor],):
+        batch_size, seq_len, _ = x.shape # |B, 1, Dim|
         
         # |B, 1, Dim| -> |B, 1, H_Q * Head_Dim|
         xq = self.wq(x)
@@ -145,12 +148,12 @@ class SelfAttention(nn.Module):
         xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
         
         # Fill the entry in cache
-        self.cache_k[:batch_size, start_pos:start_pos+seq_len] = xk
-        self.cache_v[:batch_size, start_pos:start_pos+seq_len] = xv
+        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
         
         # |B, Seq_Len_KV, H_KV, Head_Dim|
-        keys = self.cache_k[:batch_size, start_pos:start_pos+seq_len]
-        values = self.cache_k[:batch_size, start_pos:start_pos+seq_len]
+        keys = self.cache_k[:batch_size, :start_pos+seq_len]
+        values = self.cache_v[:batch_size, :start_pos+seq_len]
         
         # Since every group of Q shares the same K and V heads, just repeat (copy) the K and V heads for every Q in the same group.
         # |B, Seq_Len_KV, H_KV, Head_Dim| -> |B, Seq_Len_KV, H_Q, Head_Dim|
@@ -166,6 +169,10 @@ class SelfAttention(nn.Module):
         
         # |B, H_Q, 1, Head_Dim| @ |B, H_Q, Head_Dim, Seq_Len_KV| -> |B, H_Q, 1, Seq_Len_KV|
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            # In case the sequence length is not 0
+            # |B, H_Q, Seq_Len, Seq_Len_KV| + |Seq_Len, Seq_Len_KV + Seq_Len| -> |B, H_Q, Seq_Len, Seq_Len_KV|
+            scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         
         # |B, H_Q, 1, Seq_Len_KV| @ |B, H_Q, Seq_Len_KV, Head_Dim}| -> |B, H_Q, 1, Head_Dim|
@@ -219,10 +226,16 @@ class EncoderBlock(nn.Module):
         # RMS normalization before the feed forward block
         self.ffn_norm = RMSNorm(dim=args.dim, eps=args.norm_eps)
         
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
         # |B, Seq_Len, Dim|
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_complex
+            self.attention_norm(x), start_pos, freqs_complex, mask
         )
         # |B, Seq_Len, Dim|
         out = h + self.feed_forward.forward(self.ffn_norm(h))
@@ -251,11 +264,12 @@ class Transformer(nn.Module):
             args.max_seq_len * 2,
             device=args.device
         )
-            
+    
+    @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         # |B, Seq_Len|; Seq_Len would be 1 due to KV cache
+        # However, it also could be larger than 1. In this case, we have to input mask.
         batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed due to KV cache."
         
         # |B, Seq_Len| -> |B, Seq_Len, Dim|
         h = self.tok_embeddings(tokens)
@@ -263,15 +277,35 @@ class Transformer(nn.Module):
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         freqs_complex = self.freqs_complex[start_pos: start_pos+seq_len]
         
+        mask = None
+        if seq_len > 1:
+            mask = torch.full(
+                (seq_len, seq_len), float("-inf"), device=tokens.device
+            )
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            
+            # Horizontal stack
+            # |Seq_Len, Seq_Len_KV| & |Seq_Len, Seq_Len| -> |Seq_Len, Seq_Len_KV + Seq_Len|
+            mask = torch.hstack([
+                torch.zeros((seq_len, start_pos), device=tokens.device),
+                mask
+            ]).type_as(h)
+        
         # Iteratively aply all the encoding layers
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_complex)
+            h = layer(h, start_pos, freqs_complex, mask=mask)
         
         # apply RMS Normalization
         h = self.norm(h)
         
         # |B, Seq_Len, Vocab_Size|
-        output = self.output(h)
+        output = self.output(h).float()
         return output
         
             
