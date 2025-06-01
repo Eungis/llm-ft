@@ -1,0 +1,1 @@
+MECAB_KO_DIC_PATH="/usr/local/lib/mecab/dic/mecab-ko-dic"
